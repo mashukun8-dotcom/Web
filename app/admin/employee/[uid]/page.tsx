@@ -3,37 +3,26 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { getSupabase } from "../../../../lib/supabase";
+import TopNav from "../../../_components/TopNav";
 
-/* =====================
-   型定義
-===================== */
-
-type EmployeeRow = {
-  employee_no: string | null;
-};
-
-type AttendanceDay = {
+type Ev = {
+  id: string;
   user_id: string;
+  type: "in" | "out" | "break_in" | "break_out";
+  happened_at: string;
   work_date: string; // YYYY-MM-DD
-  in_at: string | null;
-  out_at: string | null;
-  break_minutes: number;
   location: string | null;
-  updated_at: string;
 };
 
-/* =====================
-   ユーティリティ
-===================== */
+const ymdJST = (d: Date) =>
+  d.toLocaleDateString("en-CA", { timeZone: "Asia/Tokyo" });
 
-const hmJSTFromISO = (iso: string | null) => {
-  if (!iso) return "-";
-  return new Date(iso).toLocaleTimeString("ja-JP", {
+const hmJST = (d: Date) =>
+  d.toLocaleTimeString("ja-JP", {
+    timeZone: "Asia/Tokyo",
     hour: "2-digit",
     minute: "2-digit",
-    timeZone: "Asia/Tokyo",
   });
-};
 
 const fmtMinutes = (m: number) => {
   const mm = Math.max(0, Math.floor(m));
@@ -42,126 +31,148 @@ const fmtMinutes = (m: number) => {
   return `${h}h ${String(r).padStart(2, "0")}m`;
 };
 
-/* =====================
-   ページ本体
-===================== */
+function calcDay(events: Ev[], ymd: string, today: string) {
+  const day = events
+    .filter((e) => e.work_date === ymd)
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(a.happened_at).getTime() - new Date(b.happened_at).getTime()
+    );
+
+  const firstIn = day.find((e) => e.type === "in");
+  const lastOut = [...day].reverse().find((e) => e.type === "out");
+
+  const start = firstIn ? new Date(firstIn.happened_at) : null;
+  const end = lastOut
+    ? new Date(lastOut.happened_at)
+    : start && ymd === today
+    ? new Date()
+    : null;
+
+  let breakMins = 0;
+  let open: Date | null = null;
+  for (const e of day) {
+    if (e.type === "break_in") open = new Date(e.happened_at);
+    if (e.type === "break_out" && open) {
+      breakMins +=
+        (new Date(e.happened_at).getTime() - open.getTime()) / 60000;
+      open = null;
+    }
+  }
+  if (open && ymd === today) breakMins += (Date.now() - open.getTime()) / 60000;
+
+  const gross = start && end ? (end.getTime() - start.getTime()) / 60000 : 0;
+  const net = Math.max(0, gross - breakMins);
+
+  const location =
+    firstIn?.location ??
+    [...day].reverse().find((x) => x.location)?.location ??
+    "";
+
+  return { ymd, start, end, breakMins, netMins: net, location };
+}
 
 export default function AdminEmployeePage() {
   const r = useRouter();
   const params = useParams();
-  const uid = String((params as any)?.uid ?? "");
+  const uid = (params as any)?.uid as string;
+
+  const supabase = getSupabase() as any;
 
   const [label, setLabel] = useState("確認中...");
   const [employeeNo, setEmployeeNo] = useState("");
-  const [rows, setRows] = useState<AttendanceDay[]>([]);
-  const [month, setMonth] = useState(() =>
-    new Date().toISOString().slice(0, 7)
-  );
+  const [month, setMonth] = useState(() => ymdJST(new Date()).slice(0, 7)); // YYYY-MM
+  const [events, setEvents] = useState<Ev[]>([]);
   const [msg, setMsg] = useState("");
 
-  /* =====================
-     データ取得
-  ===================== */
+  const today = useMemo(() => ymdJST(new Date()), []);
 
   const load = async () => {
     setMsg("");
-    const supabase = getSupabase();
 
-    // 管理者ログイン確認
-    const { data: u } = await supabase.auth.getUser();
+    // auth
+    const { data: u, error: uerr } = await supabase.auth.getUser();
+    if (uerr) return setMsg(uerr.message);
     if (!u.user) return r.push("/login");
+    setLabel(u.user.email ?? `uid: ${u.user.id}`);
 
-    setLabel(u.user.email ?? u.user.id);
-
-    // 社員番号取得（★ never 回避）
-    const emp = await supabase
-      .from("employees")
-      .select("employee_no")
-      .eq("user_id", uid)
-      .maybeSingle<EmployeeRow>();
-
-    setEmployeeNo(emp.data?.employee_no ?? "");
-
-    // 勤怠取得
-    const days = await supabase
-      .from("attendance_days")
-      .select(
-        "user_id,work_date,in_at,out_at,break_minutes,location,updated_at"
-      )
-      .eq("user_id", uid)
-      .order("work_date", { ascending: false })
-      .limit(400);
-
-    if (days.error) {
-      setMsg(days.error.message);
+    if (!uid) {
+      setMsg("uid が不正です");
       return;
     }
 
-    setRows(days.data ?? []);
+    // 社員番号取得（型引数を使わず any で読む）
+    const empRes = await supabase
+      .from("employees")
+      .select("employee_no,full_name")
+      .eq("user_id", uid)
+      .maybeSingle();
+
+    if (empRes.error) return setMsg(empRes.error.message);
+    const emp = (empRes.data ?? null) as any;
+    setEmployeeNo(emp?.employee_no ?? "");
+
+    // 勤怠イベント取得
+    const evRes = await supabase
+      .from("attendance_events")
+      .select("id,user_id,type,happened_at,work_date,location")
+      .eq("user_id", uid)
+      .order("happened_at", { ascending: false })
+      .limit(5000);
+
+    if (evRes.error) return setMsg(evRes.error.message);
+    setEvents((evRes.data ?? []) as Ev[]);
   };
 
   useEffect(() => {
-    if (!uid) return;
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid]);
 
-  /* =====================
-     月フィルタ
-  ===================== */
-
-  const monthRows = useMemo(
-    () => rows.filter((r) => r.work_date.startsWith(month)),
-    [rows, month]
-  );
+  const rows = useMemo(() => {
+    const keys = Array.from(new Set(events.map((e) => e.work_date)))
+      .filter((d) => d.startsWith(month))
+      .sort((a, b) => (a < b ? 1 : -1));
+    return keys.map((k) => calcDay(events, k, today));
+  }, [events, month, today]);
 
   const totalNet = useMemo(
-    () =>
-      monthRows.reduce((s, x) => {
-        if (!x.in_at || !x.out_at) return s;
-        const mins =
-          (new Date(x.out_at).getTime() -
-            new Date(x.in_at).getTime()) /
-            60000 -
-          (x.break_minutes ?? 0);
-        return s + Math.max(0, mins);
-      }, 0),
-    [monthRows]
+    () => rows.reduce((s, d) => s + d.netMins, 0),
+    [rows]
   );
-
-  /* =====================
-     表示
-  ===================== */
 
   return (
     <main style={{ padding: 24 }}>
-      <h1>社員別 勤怠（管理者）</h1>
+      <TopNav showAdmin title="社員別 勤怠" />
 
-      <p>ログイン中：{label}</p>
-      <p>
-        対象社員：<b>{employeeNo || "（社員番号未設定）"}</b>
-      </p>
+      <h1 style={{ marginTop: 12 }}>社員別 勤怠</h1>
+      <p>管理者ログイン中：{label}</p>
 
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
         <button onClick={() => r.push("/admin")}>管理者へ戻る</button>
         <button onClick={load}>更新</button>
       </div>
 
       {msg && <p style={{ color: "crimson" }}>{msg}</p>}
 
-      <div style={{ marginTop: 12 }}>
+      <h2 style={{ marginTop: 18 }}>
+        対象：{employeeNo || "(社員番号未設定)"} / uid: {uid}
+      </h2>
+
+      <div style={{ marginTop: 10 }}>
         <label>
-          対象月：
+          対象月（YYYY-MM）：
           <input
             value={month}
-            onChange={(e) => setMonth(e.target.value)}
-            placeholder="YYYY-MM"
-            style={{ marginLeft: 8, padding: 4 }}
+            onChange={(e) => setMonth(e.target.value.trim())}
+            style={{ marginLeft: 8, padding: 6 }}
+            placeholder="2025-12"
           />
         </label>
       </div>
 
-      <p style={{ marginTop: 8 }}>
+      <p style={{ marginTop: 10 }}>
         今月の実労働合計：<b>{fmtMinutes(totalNet)}</b>
       </p>
 
@@ -170,45 +181,42 @@ export default function AdminEmployeePage() {
       >
         <thead>
           <tr>
-            <th style={{ padding: 6, borderBottom: "1px solid #ddd" }}>日付</th>
-            <th style={{ padding: 6, borderBottom: "1px solid #ddd" }}>出勤</th>
-            <th style={{ padding: 6, borderBottom: "1px solid #ddd" }}>退勤</th>
-            <th style={{ padding: 6, borderBottom: "1px solid #ddd" }}>休憩</th>
-            <th style={{ padding: 6, borderBottom: "1px solid #ddd" }}>実労働</th>
-            <th style={{ padding: 6, borderBottom: "1px solid #ddd" }}>場所</th>
+            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #ddd" }}>
+              勤務日付
+            </th>
+            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #ddd" }}>
+              勤務時間
+            </th>
+            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #ddd" }}>
+              休憩時間
+            </th>
+            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #ddd" }}>
+              勤務場所
+            </th>
           </tr>
         </thead>
         <tbody>
-          {monthRows.map((x) => {
-            const net =
-              x.in_at && x.out_at
-                ? Math.max(
-                    0,
-                    (new Date(x.out_at).getTime() -
-                      new Date(x.in_at).getTime()) /
-                      60000 -
-                      (x.break_minutes ?? 0)
-                  )
-                : 0;
-
-            return (
-              <tr key={`${x.user_id}-${x.work_date}`}>
-                <td style={{ padding: 6 }}>{x.work_date}</td>
-                <td style={{ padding: 6 }}>{hmJSTFromISO(x.in_at)}</td>
-                <td style={{ padding: 6 }}>{hmJSTFromISO(x.out_at)}</td>
-                <td style={{ padding: 6 }}>
-                  {fmtMinutes(x.break_minutes ?? 0)}
-                </td>
-                <td style={{ padding: 6 }}>{fmtMinutes(net)}</td>
-                <td style={{ padding: 6 }}>{x.location || "-"}</td>
-              </tr>
-            );
-          })}
-
-          {monthRows.length === 0 && (
+          {rows.map((d) => (
+            <tr key={d.ymd}>
+              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>{d.ymd}</td>
+              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                {fmtMinutes(d.netMins)}
+                <span style={{ marginLeft: 10, color: "#666" }}>
+                  （{d.start ? hmJST(d.start) : "-"} → {d.end ? hmJST(d.end) : "-"}）
+                </span>
+              </td>
+              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                {fmtMinutes(d.breakMins)}
+              </td>
+              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                {d.location || "-"}
+              </td>
+            </tr>
+          ))}
+          {rows.length === 0 && (
             <tr>
-              <td colSpan={6} style={{ padding: 8 }}>
-                この月の勤怠データがありません
+              <td colSpan={4} style={{ padding: 8 }}>
+                この月の打刻がありません
               </td>
             </tr>
           )}
