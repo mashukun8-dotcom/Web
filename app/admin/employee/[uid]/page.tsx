@@ -50,6 +50,7 @@ function calcDay(events: Ev[], ymd: string, today: string) {
     ? new Date()
     : null;
 
+  // 休憩計算（休憩開始/終了が残っている前提。ボタンは消していても過去データがある場合に対応）
   let breakMins = 0;
   let open: Date | null = null;
   for (const e of day) {
@@ -78,51 +79,60 @@ export default function AdminEmployeePage() {
   const params = useParams();
   const uid = (params as any)?.uid as string;
 
+  // ✅ 型引数を一切使わないため、supabase は any で統一（Vercel build で落ちない）
   const supabase = getSupabase() as any;
 
   const [label, setLabel] = useState("確認中...");
   const [employeeNo, setEmployeeNo] = useState("");
+  const [fullName, setFullName] = useState<string>("");
   const [month, setMonth] = useState(() => ymdJST(new Date()).slice(0, 7)); // YYYY-MM
   const [events, setEvents] = useState<Ev[]>([]);
   const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
 
   const today = useMemo(() => ymdJST(new Date()), []);
 
   const load = async () => {
     setMsg("");
+    setBusy(true);
+    try {
+      // auth
+      const { data: u, error: uerr } = await supabase.auth.getUser();
+      if (uerr) return setMsg(uerr.message);
+      if (!u.user) return r.push("/login");
+      setLabel(u.user.email ?? `uid: ${u.user.id}`);
 
-    // auth
-    const { data: u, error: uerr } = await supabase.auth.getUser();
-    if (uerr) return setMsg(uerr.message);
-    if (!u.user) return r.push("/login");
-    setLabel(u.user.email ?? `uid: ${u.user.id}`);
+      if (!uid) {
+        setMsg("uid が不正です");
+        return;
+      }
 
-    if (!uid) {
-      setMsg("uid が不正です");
-      return;
+      // 社員情報（employee_no, full_name）
+      const empRes = await supabase
+        .from("employees")
+        .select("employee_no,full_name")
+        .eq("user_id", uid)
+        .maybeSingle();
+
+      if (empRes.error) return setMsg(empRes.error.message);
+
+      const emp = (empRes.data ?? null) as any;
+      setEmployeeNo(emp?.employee_no ?? "");
+      setFullName(emp?.full_name ?? "");
+
+      // イベント
+      const evRes = await supabase
+        .from("attendance_events")
+        .select("id,user_id,type,happened_at,work_date,location")
+        .eq("user_id", uid)
+        .order("happened_at", { ascending: false })
+        .limit(5000);
+
+      if (evRes.error) return setMsg(evRes.error.message);
+      setEvents((evRes.data ?? []) as Ev[]);
+    } finally {
+      setBusy(false);
     }
-
-    // 社員番号取得（型引数を使わず any で読む）
-    const empRes = await supabase
-      .from("employees")
-      .select("employee_no,full_name")
-      .eq("user_id", uid)
-      .maybeSingle();
-
-    if (empRes.error) return setMsg(empRes.error.message);
-    const emp = (empRes.data ?? null) as any;
-    setEmployeeNo(emp?.employee_no ?? "");
-
-    // 勤怠イベント取得
-    const evRes = await supabase
-      .from("attendance_events")
-      .select("id,user_id,type,happened_at,work_date,location")
-      .eq("user_id", uid)
-      .order("happened_at", { ascending: false })
-      .limit(5000);
-
-    if (evRes.error) return setMsg(evRes.error.message);
-    setEvents((evRes.data ?? []) as Ev[]);
   };
 
   useEffect(() => {
@@ -142,6 +152,20 @@ export default function AdminEmployeePage() {
     [rows]
   );
 
+  const totalOver = useMemo(() => {
+    // 8h超を残業（分）
+    const overMins = rows.reduce((s, d) => s + Math.max(0, d.netMins - 8 * 60), 0);
+    return overMins;
+  }, [rows]);
+
+  const logout = async () => {
+    try {
+      await supabase.auth.signOut();
+    } finally {
+      r.push("/login");
+    }
+  };
+
   return (
     <main style={{ padding: 24 }}>
       <TopNav showAdmin title="社員別 勤怠" />
@@ -150,14 +174,16 @@ export default function AdminEmployeePage() {
       <p>管理者ログイン中：{label}</p>
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
-        <button onClick={() => r.push("/admin")}>管理者へ戻る</button>
-        <button onClick={load}>更新</button>
+        <button disabled={busy} onClick={() => r.push("/admin")}>管理者へ戻る</button>
+        <button disabled={busy} onClick={() => r.push("/")}>勤怠（ホーム）へ</button>
+        <button disabled={busy} onClick={load}>更新</button>
+        <button disabled={busy} onClick={logout}>ログアウト</button>
       </div>
 
-      {msg && <p style={{ color: "crimson" }}>{msg}</p>}
+      {msg && <p style={{ color: "crimson", marginTop: 10 }}>{msg}</p>}
 
       <h2 style={{ marginTop: 18 }}>
-        対象：{employeeNo || "(社員番号未設定)"} / uid: {uid}
+        対象：{employeeNo || "(社員番号未設定)"} {fullName ? ` / ${fullName}` : ""} / uid: {uid}
       </h2>
 
       <div style={{ marginTop: 10 }}>
@@ -173,7 +199,7 @@ export default function AdminEmployeePage() {
       </div>
 
       <p style={{ marginTop: 10 }}>
-        今月の実労働合計：<b>{fmtMinutes(totalNet)}</b>
+        今月の実労働合計：<b>{fmtMinutes(totalNet)}</b> ／ 残業（8h超）：<b>{fmtMinutes(totalOver)}</b>
       </p>
 
       <table
@@ -193,29 +219,39 @@ export default function AdminEmployeePage() {
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #ddd" }}>
               勤務場所
             </th>
+            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #ddd" }}>
+              残業
+            </th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((d) => (
-            <tr key={d.ymd}>
-              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>{d.ymd}</td>
-              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
-                {fmtMinutes(d.netMins)}
-                <span style={{ marginLeft: 10, color: "#666" }}>
-                  （{d.start ? hmJST(d.start) : "-"} → {d.end ? hmJST(d.end) : "-"}）
-                </span>
-              </td>
-              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
-                {fmtMinutes(d.breakMins)}
-              </td>
-              <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
-                {d.location || "-"}
-              </td>
-            </tr>
-          ))}
+          {rows.map((d) => {
+            const over = Math.max(0, d.netMins - 8 * 60);
+            return (
+              <tr key={d.ymd}>
+                <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>{d.ymd}</td>
+                <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                  {fmtMinutes(d.netMins)}
+                  <span style={{ marginLeft: 10, color: "#666" }}>
+                    （{d.start ? hmJST(d.start) : "-"} → {d.end ? hmJST(d.end) : "-"}）
+                  </span>
+                </td>
+                <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                  {fmtMinutes(d.breakMins)}
+                </td>
+                <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                  {d.location || "-"}
+                </td>
+                <td style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+                  {over > 0 ? fmtMinutes(over) : "-"}
+                </td>
+              </tr>
+            );
+          })}
+
           {rows.length === 0 && (
             <tr>
-              <td colSpan={4} style={{ padding: 8 }}>
+              <td colSpan={5} style={{ padding: 8 }}>
                 この月の打刻がありません
               </td>
             </tr>
